@@ -272,6 +272,13 @@ az monitor data-collection rule show \
    - **UAMI**: `AcrPull` on ACR, `Cognitive Services User` on Azure AI Foundry.
    - **Entra Agent User**: `Log Analytics Reader` and `Monitoring Metrics Publisher` on the Sentinel workspace/DCR, plus PostgreSQL Entra role grants on the `scamintel` database.
 6. **Register Telegram Webhook**:
+
+   Generate random 32 character string (telegram webhook secret can be 1 to 256 characters long)
+   ```python
+   TELEGRAM_WEBHOOK_SECRET=$(python3 -c 'import secrets, string; alphabet = string.ascii_letters + string.digits + "_-"; print("".join(secrets.choice(alphabet) for _ in range(32)))')
+   ```
+
+   Register as webhook secret
    ```bash
    curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
      -d "url=https://<app-fqdn>/api/telegram/webhook" \

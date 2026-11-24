@@ -20,8 +20,8 @@
             "columns": [
               { "name": "TimeGenerated", "type": "datetime" },
               { "name": "ReportEntityId", "type": "string" },
-              { "name": "Type", "type": "string" },
-              { "name": "Value", "type": "string" },
+              { "name": "EntityType", "type": "string" },
+              { "name": "EntityValue", "type": "string" },
               { "name": "EvidenceRef", "type": "string" },
               { "name": "Confidence", "type": "string" },
               { "name": "FirstObservedAt", "type": "datetime" },
