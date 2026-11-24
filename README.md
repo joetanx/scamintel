@@ -2,6 +2,76 @@
 
 ScamIntel is a proof-of-concept agentic application on Azure Container Apps for collecting and investigating citizen-submitted suspected scam reports across **Web**, **Email (Agent 365)**, and **Telegram** channels.
 
+## High level components
+
+```mermaid
+flowchart TD
+    subgraph ACA[Azure Container Apps]
+        subgraph ingress
+            EasyAuth[Easy Auth]
+            Notifications[A365 notifications SDK]
+        end
+        TelegramBot[Telegram Bot] --> Agent[Langchain agent]
+        EasyAuth --> Agent
+        Notifications --> Agent
+        Agent --> AgentTools[Langchain tools]
+        Agent --> Otel[Microsoft OpenTelemetry SDK]
+    end
+    Telegram --> TelegramBot
+    Email --> Notifications
+    Browser --> EasyAuth
+    ACA -.- ACR[Azure Container Registry]
+    ACA -.- Files@{ shape: docs, label: "Azure Files NFS share" }
+    Agent -.-Foundry
+    Otel --> Observability[A365 observability service]
+    AgentTools --> Postgres[(Azure PostgreSQL)]
+    AgentTools --> Sentinel[(Sentinel/Log Analytics)]
+    AgentTools --> Search[Search: Keenable + Tavily]
+```
+
+## Virtual network components
+
+```mermaid
+flowchart TD
+    subgraph VNet[Virtual network]
+        subgraph CAE[Azure Container Apps Environment]
+            ACA[Azure Container Apps]
+        end
+        Postgres[(Azure PostgreSQL)]
+        subgraph DNS[Private DNS Zones]
+            DNS_PE[Storage endpoint zone]
+            DNS_PG[Database zone]
+        end
+
+        PE[/Azure Storage private endpoint/]
+        CAE -->|volume mount| PE
+        ACA -.->|resolve storage endpoint| DNS_PE
+        ACA -.->|resolve database| DNS_PG
+        DNS_PE -.-> PE
+        DNS_PG -.-> Postgres
+    end
+    subgraph Public
+        ACA --> Foundry
+        ACA --> Sentinel
+        PE --> Files@{ shape: docs, label: Azure Files NFS share }
+        ACR[Azure Container Registry] -->|container image| ACA
+    end
+```
+
+## Identity and access management
+
+```mermaid
+flowchart TD
+    UAMI[User-assigned managed identity]
+    UAMI -.->|federated identity credential| AgentUser[Agent user]
+    UAMI -.->|federated identity credential| EasyAuth[Easy auth app registration]
+    UAMI -->|Cognitive Services User| Foundry
+    UAMI -->|AcrPull| ACR[Azure Container Registry]
+    AgentUser -->|database role and grant| Postgres[Azure PostgreSQL]
+    AgentUser -->|Log Analytics Data Reader| Sentinel[Sentinel/Log Analytics]
+    AgentUser -->|Monitoring Metrics Publisher| Sentinel
+```
+
 ## Mounted `/app` Layout
 
 All application code and static HTML pages are mounted from an Azure Files NFS share into `/app`:
@@ -42,7 +112,7 @@ All application code and static HTML pages are mounted from an Azure Files NFS s
 
 Non-GET `/api/*` endpoints (except webhooks) require a custom `X-Requested-With` (or `X-CSRF-Token`) header and same-host `Origin` check.
 
-## Data Model & Deviations from `intent.md`
+## Data Model
 
 PostgreSQL tables must be created beforehand (see **Prerequisites** below):
 - `users`, `reports`, `assessments` (as specified in `intent.md`)
@@ -176,61 +246,8 @@ az monitor data-collection endpoint show \
   --query logsIngestion.endpoint -o tsv
 ```
 
-3. **Create the DCR ARM template `scamintel-dcr.json`** (matching `Custom-ScamIntel_CL` and linking to the DCE and Log Analytics workspace):
+3. **Download and deploy the [scamintel-dcr.json](/scamintel-dcr.json) DCR ARM template** (matching `Custom-ScamIntel_CL` and linking to the DCE and Log Analytics workspace):
 
-```json
-{
-  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-  "contentVersion": "1.0.0.0",
-  "parameters": {
-    "dataCollectionRuleName": { "type": "string" },
-    "location": { "type": "string", "defaultValue": "[resourceGroup().location]" },
-    "workspaceResourceId": { "type": "string" },
-    "endpointResourceId": { "type": "string" }
-  },
-  "resources": [
-    {
-      "type": "Microsoft.Insights/dataCollectionRules",
-      "apiVersion": "2022-06-01",
-      "name": "[parameters('dataCollectionRuleName')]",
-      "location": "[parameters('location')]",
-      "properties": {
-        "dataCollectionEndpointId": "[parameters('endpointResourceId')]",
-        "streamDeclarations": {
-          "Custom-ScamIntel_CL": {
-            "columns": [
-              { "name": "TimeGenerated", "type": "datetime" },
-              { "name": "ReportEntityId", "type": "string" },
-              { "name": "EntityType", "type": "string" },
-              { "name": "EntityValue", "type": "string" },
-              { "name": "EvidenceRef", "type": "string" },
-              { "name": "Confidence", "type": "string" },
-              { "name": "FirstObservedAt", "type": "datetime" },
-              { "name": "LastObservedAt", "type": "datetime" }
-            ]
-          }
-        },
-        "destinations": {
-          "logAnalytics": [
-            {
-              "workspaceResourceId": "[parameters('workspaceResourceId')]",
-              "name": "scamintel-la"
-            }
-          ]
-        },
-        "dataFlows": [
-          {
-            "streams": ["Custom-ScamIntel_CL"],
-            "destinations": ["scamintel-la"],
-            "transformKql": "source",
-            "outputStream": "Custom-ScamIntel_CL"
-          }
-        ]
-      }
-    }
-  ]
-}
-```
 
 4. **Deploy the DCR and retrieve `immutableId` (`DCR_IMMUTABLE_ID`)**:
 
@@ -272,13 +289,6 @@ az monitor data-collection rule show \
    - **UAMI**: `AcrPull` on ACR, `Cognitive Services User` on Azure AI Foundry.
    - **Entra Agent User**: `Log Analytics Reader` and `Monitoring Metrics Publisher` on the Sentinel workspace/DCR, plus PostgreSQL Entra role grants on the `scamintel` database.
 6. **Register Telegram Webhook**:
-
-   Generate random 32 character string (telegram webhook secret can be 1 to 256 characters long)
-   ```python
-   TELEGRAM_WEBHOOK_SECRET=$(python3 -c 'import secrets, string; alphabet = string.ascii_letters + string.digits + "_-"; print("".join(secrets.choice(alphabet) for _ in range(32)))')
-   ```
-
-   Register as webhook secret
    ```bash
    curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
      -d "url=https://<app-fqdn>/api/telegram/webhook" \
