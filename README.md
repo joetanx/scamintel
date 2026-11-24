@@ -71,6 +71,53 @@ flowchart TD
     AgentUser -->|Log Analytics Data Reader| Sentinel[Sentinel/Log Analytics]
     AgentUser -->|Monitoring Metrics Publisher| Sentinel
 ```
+## Reports lifecycle
+
+```mermaid
+flowchart TD
+    Agent[Langchain agent]
+    Telegram -->|via bot| Agent
+    Email -->|via A365 notifications| Agent
+    Browser -->|web submission| Agent
+    Agent --> Extraction
+    Search[Search: Keenable + Tavily]
+    subgraph Azure PostgreSQL
+        Reports[(Reports)]
+        Entities[(Entities)]
+    end
+    Extraction -->|new report| Reports
+    Extraction -->|new entities| Entities
+    subgraph Sentinel
+        scamintel[(ScamIntel_CL)]
+        mdti[(ThreatIntelIndicators)]
+    end
+    subgraph Triage
+        SearchTI{match threat intelligence}
+        SearchTI -.->|search| mdti
+        SearchTI -->|yes| UpdateEntity[Update entity record with findings]
+        SearchTI -->|no| SearchScamIntel{match scam intel base}
+        SearchScamIntel -.->|search| scamintel
+        SearchScamIntel -->|yes| UpdateEntity
+        SearchScamIntel -->|no| SearchWeb{search web information}
+        SearchWeb -->|signs of malice| UpdateEntity
+        SearchWeb -->|nothing found| TriageComplete[Update report with triage assessment]
+        UpdateEntity --> TriageComplete
+    end
+    SearchWeb -.->|search| Search
+    Extraction --> SearchTI
+    UpdateEntity -->|update| Entities
+    TriageComplete -->|update| Reports
+    subgraph Human review
+        TriageComplete --> Review{Approve ?}
+        Review -->|yes| HumanComplete[Report completed]
+        Review --> |no| HumanInvestigate[Human manual investigation]
+        HumanInvestigate --> HumanUpdate[/Edit record with human findings/]
+        HumanUpdate --> HumanComplete
+        HumanUpdate -->|update| Reports
+        HumanUpdate -->|update| Entities
+        HumanComplete -->|insert new or repeated entities | scamintel
+    end
+```
 
 ## Mounted `/app` Layout
 
