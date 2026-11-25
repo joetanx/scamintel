@@ -1,8 +1,10 @@
-# ScamIntel PoC
+# ScamIntel
 
-ScamIntel is a proof-of-concept agentic application on Azure Container Apps for collecting and investigating citizen-submitted suspected scam reports across **Web**, **Email (Agent 365)**, and **Telegram** channels.
+ScamIntel is a proof-of-concept agentic application on Azure Container Apps for a simulated use case of collecting and investigating citizen-submitted suspected scam reports across **Web**, **Email (Agent 365)**, and **Telegram** channels.
 
-## High level components
+## 1. Architecture
+
+### 1.1. High level components
 
 ```mermaid
 flowchart TD
@@ -29,7 +31,7 @@ flowchart TD
     AgentTools --> Search[Search: Keenable + Tavily]
 ```
 
-## Virtual network components
+### 1.2. Virtual network components
 
 ```mermaid
 flowchart TD
@@ -58,7 +60,7 @@ flowchart TD
     end
 ```
 
-## Identity and access management
+### 1.3. Identity and access management
 
 ```mermaid
 flowchart TD
@@ -71,7 +73,12 @@ flowchart TD
     AgentUser -->|Log Analytics Data Reader| Sentinel[Sentinel/Log Analytics]
     AgentUser -->|Monitoring Metrics Publisher| Sentinel
 ```
-## Reports lifecycle
+
+## 2. Investigation Flow
+
+1. **Intake:** The app stores the report as `pending`. Web and Telegram requests schedule triage in the app process; email handlers await triage before replying. Background work is not backed by a durable queue.
+2. **Triage:** The app extracts URLs, domains, email addresses, IPv4 addresses, and phone numbers. It resolves domains and checks observables against `ThreatIntelIndicators` and `ScamIntel_CL`. If a Foundry model is configured, a LangChain agent can enrich unmatched entities with DNS, DNS blocklist, and configured Keenable or Tavily search tools. The app saves a versioned assessment and sets the report to `triaged`.
+3. **Review and publication:** Staff can update entity findings and commit a verdict: `suspected_scam`, `likely_benign`, or `inconclusive`. The commit stores a new assessment and sets the report to `committed`. For `suspected_scam`, the app attempts to publish flagged entities and entities matched to `public_web` or `scamintel` to `ScamIntel_CL`. Publication happens after the database commit; a failed upload is reported separately and does not roll back the review.
 
 ```mermaid
 flowchart TD
@@ -119,70 +126,88 @@ flowchart TD
     end
 ```
 
-## Mounted `/app` Layout
+## 3. Project components
 
-All application code and static HTML pages are mounted from an Azure Files NFS share into `/app`:
+### 3.1. Data model
 
-```text
-/app/
-├── app.py          # aiohttp server, PostgreSQL/Sentinel helpers, LangChain agent, webhooks
-├── index.html      # Public splash page with Entra Easy Auth login & logout banner
-├── citizen.html    # Citizen AJAX portal (submit report, track status)
-└── staff.html      # Staff AJAX triage console (review, edit, commit, inline Sentinel publication)
-```
+| Table | Contents |
+| --- | --- |
+| `users` | Browser identities keyed by Entra tenant and object ID. |
+| `reports` | Channel, source message ID, subject, body, processing status, and latest verdict. Email and Telegram reports have no linked browser user. |
+| `entities` | Extracted indicators with match source, evidence, confidence, and publication flag. |
+| `assessments` | Versioned automated and staff verdicts and rationales, with the reviewer ID where applicable. |
 
-`pyproject.toml` and `containerapp.yaml` live in the deployment repo (with `Dockerfile` baking the Python virtual environment from `pyproject.toml` while `/app` is volume-mounted at runtime).
+### 3.2. HTTP routes
 
-## Investigation Flow
+Browser API calls use the identity supplied by Easy Auth. Mutating browser API requests require either `X-Requested-With` or `X-CSRF-Token`; if an `Origin` header is sent, its host must match the request host. `{id}` denotes a report UUID.
 
-1. **Intake**: Citizens submit reports via Web (`POST /api/reports`), Email (`POST /api/messages` via M365 Agents SDK / A365 Notifications), or Telegram (`POST /api/telegram/webhook`).
-2. **Deterministic Extraction & Lookups**: `investigate_report` extracts URLs, emails, domains, IPv4 addresses, and phone numbers (`extract_entities`), resolves domain IPs via `dnspython`, and queries Microsoft Sentinel `ThreatIntelIndicators` and `ScamIntel_CL` via `azure-monitor-query`.
-3. **Agent Investigation**: Unmatched entities are investigated by a LangChain agent (`create_agent` with `ToolStrategy(TriageResult)`) using Azure AI Foundry, Keenable/Tavily remote MCP search tools, DNS lookup, and `dnspython` domain/MX DNSBL lookups (Spamhaus DBL/ZEN, SURBL, SpamCop, filtering out `127.255.255.*` resolver-block codes). If any check or the agent fails, the verdict degrades safely to `inconclusive` (never `likely_benign`).
-4. **Staff Review & Commit**: Staff review triaged reports in `/staff`, optionally edit entity matches/flags or verdict/rationale, and commit (`POST /api/staff/reports/{id}/commit`). Flagged entities (`public_web` malice or repeated `scamintel` matches) are published to `ScamIntel_CL` via `azure-monitor-ingestion`.
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/`, `/citizen`, `/staff` | Landing page, citizen portal, and staff console. |
+| `GET` | `/health`, `/api/health` | HTTP liveness; returns `ok` without checking dependencies. |
+| `GET` | `/api/me` | Return the signed-in user's profile. |
+| `GET` | `/api/reports` | List the signed-in user's reports. |
+| `POST` | `/api/reports` | Submit JSON with required `body_text` and optional `subject`; returns `201` with the new report. |
+| `GET` | `/api/reports/{id}`, `/api/staff/reports/{id}` | Return the report, entities, and assessment history. |
+| `GET` | `/api/staff/reports` | List reports across channels; accepts an optional `status` query parameter. |
+| `POST` | `/api/staff/reports/{id}/commit` | Save a review with `verdict`, `rationale`, and optional `entities` updates; returns `detail` and `publication`. |
+| `POST` | `/api/telegram/webhook` | Receive Telegram text or captions. Checks the Telegram secret header when configured. |
+| `GET`, `POST` | `/api/messages` | GET is a no-op check; POST receives Microsoft 365 agent activities through the SDK adapter. |
 
-## API Endpoints
+> **Access control:** The current app authenticates browser API callers but does not enforce staff roles on staff APIs or report ownership on either report-detail route. Enforce those checks before allowing citizen and staff access to the same deployment. Keep the backend behind trusted authentication ingress that supplies the identity headers; do not accept caller-supplied identity headers from untrusted clients.
 
-| Method & Path | Auth / Protection | Purpose |
-|---|---|---|
-| `GET /` | Public | Login splash page (`index.html`), shows logout banner on `?logged_out=1` |
-| `GET /citizen`, `GET /staff` | Easy Auth | Citizen and Staff AJAX UIs |
-| `GET /health`, `GET /api/health` | Public | Container Apps health probe |
-| `GET /api/me` | Easy Auth | Upserts and returns current `users` record |
-| `GET /api/reports` | Easy Auth | List reports submitted by current user |
-| `POST /api/reports` | Easy Auth + CSRF | Submit a new web report (`subject`, `body_text`) |
-| `GET /api/reports/{id}` | Easy Auth | Get report detail, entities, and assessments |
-| `GET /api/staff/reports` | Easy Auth | List all reports (optional `?status=`) |
-| `GET /api/staff/reports/{id}` | Easy Auth | Get full report detail for staff review |
-| `POST /api/staff/reports/{id}/commit` | Easy Auth + CSRF | Append staff assessment, update report, publish flagged indicators to Sentinel |
-| `POST /api/telegram/webhook` | `X-Telegram-Bot-Api-Secret-Token` | Telegram Bot message intake |
-| `POST /api/messages` | M365 Agents JWT | Agent 365 email notification & Bot Framework intake |
+### 3.3. Configuration
 
-Non-GET `/api/*` endpoints (except webhooks) require a custom `X-Requested-With` (or `X-CSRF-Token`) header and same-host `Origin` check.
+| Area | Environment variables |
+| --- | --- |
+| HTTP | `HOST` (default `0.0.0.0`), `PORT` (`8080`), `LOG_LEVEL` (`INFO`). `ALLOW_DEV_AUTH` is for local testing only. |
+| PostgreSQL | `PGHOST`, `PGUSER`, `PGDATABASE` (`scamintel`), `PGPORT` (`5432`), `PGSSLMODE` (`require`). With `PGPASSWORD` unset, the app requests an Entra Agent User token. |
+| Azure AI Foundry | `FOUNDRY_PROJECT_ENDPOINT` and `FOUNDRY_MODEL` enable model-assisted triage; `UAMI_CLIENT_ID` selects the user-assigned managed identity. |
+| Microsoft 365 Agents | `AGENTIC_INSTANCE_ID`, `AGENTIC_USER_ID`, and the five service-connection settings below. `TENANT_ID` is an app fallback and a deployment template input. |
+| Azure Monitor | `LOG_ANALYTICS_WORKSPACE_ID` is the workspace ID used for queries. For ingestion, set `DCE_ENDPOINT` to the logs ingestion URL and `DCR_IMMUTABLE_ID` to the rule's immutable ID. `DCR_STREAM_NAME` defaults to `Custom-ScamIntel_CL`. |
+| Public web search | `KEENABLE_API_KEY` and `TAVILY_API_KEY` enable their respective MCP search integrations. |
+| Telegram | `TELEGRAM_BOT_TOKEN` is used for acknowledgement messages. Set `TELEGRAM_WEBHOOK_SECRET` to the same secret used when registering the webhook. |
 
-## Data Model
+For the federated Microsoft 365 Agents service connection shown in the deployment template, set:
 
-PostgreSQL tables must be created beforehand (see **Prerequisites** below):
-- `users`, `reports`, `assessments` (as specified in `intent.md`)
-- An append-only `entities` table (keyed by `id`, linked to `reports(id)`, indexed on `(type, value)`), with `confidence` (`low` | `medium` | `high`) and `flag_for_scamintel` (`boolean`). `FirstObservedAt` / `LastObservedAt` for `ScamIntel_CL` are computed via `MIN(reports.received_at)` / `MAX(reports.received_at)` across all rows matching `(type, value)`.
-- **Added column on `assessments`**: `actor_user_id` (`UUID`, nullable) to link staff reviews to `users.id`.
-- Flagged entities are published inline to `ScamIntel_CL` during `POST /api/staff/reports/{id}/commit`; any ingestion failure is logged with the failed payload without blocking the commit.
+| Variable | Value |
+| --- | --- |
+| `CONNECTIONS__SERVICE_CONNECTION__SETTINGS__AUTHORITY` | `https://login.microsoftonline.com/<tenant-id>` |
+| `CONNECTIONS__SERVICE_CONNECTION__SETTINGS__AUTHTYPE` | `FederatedCredentials` |
+| `CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID` | Agent blueprint client ID |
+| `CONNECTIONS__SERVICE_CONNECTION__SETTINGS__FEDERATEDCLIENTID` | User-assigned managed identity client ID |
+| `CONNECTIONS__SERVICE_CONNECTION__SETTINGS__TENANTID` | Entra tenant ID |
 
-## Environment Variables
+### 3.4. Repository layout
 
-| Variable | Purpose |
-|---|---|
-| `HOST`, `PORT`, `LOG_LEVEL` | `aiohttp` listener (`0.0.0.0:8080`) and log verbosity |
-| `FOUNDRY_PROJECT_ENDPOINT`, `FOUNDRY_MODEL`, `UAMI_CLIENT_ID` | Azure AI Foundry model & User-Assigned Managed Identity |
-| `CONNECTIONS__SERVICE_CONNECTION__SETTINGS__*`, `AGENTIC_INSTANCE_ID`, `AGENTIC_USER_ID` | M365 Agents SDK / Entra Agent User federated credentials |
-| `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGSSLMODE` | Azure PostgreSQL connection (uses Entra token; `PGPASSWORD` optional for local dev) |
-| `LOG_ANALYTICS_WORKSPACE_ID`, `DCE_ENDPOINT`, `DCR_IMMUTABLE_ID`, `DCR_STREAM_NAME` | Sentinel Log Analytics query & `ScamIntel_CL` Logs Ingestion |
-| `KEENABLE_API_KEY`, `TAVILY_API_KEY` | Keenable and Tavily remote MCP search API keys |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET` | Telegram bot reply & webhook secret validation |
-| `ALLOW_DEV_AUTH` | Set `"true"` only for local non-Easy-Auth testing |
+| File | Purpose |
+| --- | --- |
+| [`app.py`](app.py) | aiohttp application, intake handlers, PostgreSQL access, triage, and publishing. |
+| [`index.html`](index.html), [`citizen.html`](citizen.html), [`staff.html`](staff.html) | Landing page, report portal, and staff console. |
+| [`pyproject.toml`](pyproject.toml) | Python version and dependencies. |
+| [`pg-tables.sql`](pg-tables.sql) | PostgreSQL schema and entity lookup index. |
+| [`scamintel-dcr.json`](scamintel-dcr.json) | ARM template for the data collection rule and `Custom-ScamIntel_CL` stream. |
+| [`Dockerfile`](Dockerfile), [`containerapp.yaml`](containerapp.yaml) | Dependency image and Azure Container Apps deployment template. |
 
-## Prerequisites
+## 4. Deployment
 
-### 1. PostgreSQL Database & Tables
+### 4.1. Prerequisites
+
+#### 4.1.1. Azure infra
+
+The project uses the following Azure infra services:
+- Microsoft Foundry
+- Azure Container Registry (ACR)
+- Azure Container Apps environment
+- Azure Files NFS share
+- Azure PostgresSQL flexible server
+- Azure networking: virtual network, subnet, private DNS zone, private endpoint
+
+> The project shared infra base is adapted to the [Agent 365 samples write-up](https://github.com/joetanx/mslab/tree/main/agent-365/samples)
+>
+> This should likely be consolidated in the future into a separate *AgentsLab* setup documentation
+
+#### 4.1.2. PostgreSQL tables
 
 Acquire an Entra access token for Azure Database for PostgreSQL, connect via `psql`, and create the required tables:
 
@@ -192,65 +217,10 @@ export PGPASSWORD=$(az account get-access-token \
   --query accessToken \
   --output tsv)
 
-psql -h <postgres-fqdn> -p 5432 -U <user-name> -d <dbname>
+psql -h <postgres-fqdn> -p 5432 -U <user-name> -d <dbname> -f pg-tables.sql
 ```
 
-Run the following SQL:
-
-```sql
-CREATE TABLE IF NOT EXISTS users (
-    id UUID PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    object_id TEXT NOT NULL,
-    display_name TEXT,
-    email TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_login_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (tenant_id, object_id)
-);
-
-CREATE TABLE IF NOT EXISTS reports (
-    id UUID PRIMARY KEY,
-    reporter_user_id UUID NULL REFERENCES users(id),
-    channel TEXT NOT NULL CHECK (channel IN ('web', 'email', 'telegram')),
-    channel_message_id TEXT NOT NULL,
-    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    subject TEXT,
-    body_text TEXT NOT NULL,
-    processing_status TEXT NOT NULL DEFAULT 'pending',
-    assessment TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS entities (
-    id UUID PRIMARY KEY,
-    report_id UUID NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
-    type TEXT NOT NULL,
-    value TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    matches TEXT NOT NULL DEFAULT 'none' CHECK (matches IN ('scamintel', 'microsoft_ti', 'public_web', 'none')),
-    evidence_ref TEXT,
-    confidence TEXT NOT NULL DEFAULT 'medium' CHECK (confidence IN ('low', 'medium', 'high')),
-    flag_for_scamintel BOOLEAN NOT NULL DEFAULT FALSE
-);
-
-CREATE INDEX IF NOT EXISTS idx_entities_type_value ON entities (type, value);
-
-CREATE TABLE IF NOT EXISTS assessments (
-    id UUID PRIMARY KEY,
-    report_id UUID NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
-    version INTEGER NOT NULL,
-    verdict TEXT NOT NULL CHECK (verdict IN ('suspected_scam', 'likely_benign', 'inconclusive')),
-    rationale TEXT NOT NULL,
-    actor_type TEXT NOT NULL CHECK (actor_type IN ('agent', 'staff')),
-    actor_user_id UUID NULL REFERENCES users(id),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (report_id, version)
-);
-```
-
-### 2. Microsoft Sentinel (`ScamIntel_CL` Table, DCE, and DCR)
+#### 4.1.3. Microsoft Sentinel (`ScamIntel_CL` Table, DCE, and DCR)
 
 1. **Create the custom Log Analytics table `ScamIntel_CL`**:
 
@@ -318,7 +288,29 @@ az monitor data-collection rule show \
   --query immutableId -o tsv
 ```
 
-## Deployment Steps
+#### 4.1.4. Identity and access
+
+> draft notes here - to be updated
+
+##### UAMI assignments
+
+> Give the Container App's user-assigned managed identity `AcrPull` on ACR and model access on the Foundry resource. Configure the Agent blueprint's federated service connection for the Agent User; give that user query access to the workspace and `Monitoring Metrics Publisher` on the DCR.
+
+##### Entra Agent Identity and Agent User
+
+> a365 setup all -n $APP_DISPLAY_NAME
+>
+> az rest --method post --url "https://graph.microsoft.com/v1.0/users/microsoft.graph.agentUser" ....
+
+##### Container Apps Easy Auth
+
+> Configure browser login with Entra Easy Auth separately; it is not configured by [`containerapp.yaml`](containerapp.yaml). Ensure enabled intake webhooks can reach their routes without browser sign-in and use their own authentication.
+
+#### 4.1.5. Telegram bot
+
+> brief description of creating with bot with Telegram bot father
+
+## 4.2. Deployment Steps
 
 1. **Build & Push Image**:
    ```bash
